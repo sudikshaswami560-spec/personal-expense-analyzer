@@ -4,10 +4,56 @@ from typing import List, Optional, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc, asc
 from . import models, schemas
+from .auth import verify_password, get_password_hash
 
+
+# ==========================================
+# USER AUTHENTICATION & CRUD
+# ==========================================
+
+def get_user_by_email(db: Session, email: str) -> Optional[models.User]:
+    """Retrieve user by normalized email address."""
+    clean_email = email.strip().lower()
+    return db.query(models.User).filter(models.User.email == clean_email).first()
+
+
+def get_user_by_id(db: Session, user_id: int) -> Optional[models.User]:
+    """Retrieve user by primary key ID."""
+    return db.query(models.User).filter(models.User.id == user_id).first()
+
+
+def create_user(db: Session, user_in: schemas.UserCreate) -> models.User:
+    """Creates a new user with salted bcrypt password hash."""
+    clean_email = user_in.email.strip().lower()
+    hashed = get_password_hash(user_in.password)
+    user = models.User(
+        email=clean_email,
+        hashed_password=hashed,
+        full_name=user_in.full_name.strip() if user_in.full_name else None,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def authenticate_user(db: Session, email: str, password: str) -> Optional[models.User]:
+    """Validates user email and password; returns User if valid, None otherwise."""
+    user = get_user_by_email(db, email)
+    if not user:
+        return None
+    if not verify_password(password, user.hashed_password):
+        return None
+    return user
+
+
+# ==========================================
+# EXPENSES CRUD (SCOPED TO USER)
+# ==========================================
 
 def get_expenses(
     db: Session,
+    user_id: int,
     month: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
@@ -17,7 +63,8 @@ def get_expenses(
     sort_by: str = "date",
     sort_order: str = "desc",
 ) -> List[models.Expense]:
-    query = db.query(models.Expense)
+    """Retrieve expenses strictly belonging to user_id with optional filters."""
+    query = db.query(models.Expense).filter(models.Expense.user_id == user_id)
 
     if month and month.lower() != "all":
         query = query.filter(models.Expense.date.startswith(month))
@@ -32,11 +79,16 @@ def get_expenses(
         query = query.filter(models.Expense.category == category)
 
     if payment_method and payment_method.lower() != "all":
-        # Handle UPI / Bank Transfer matching or specific
         if payment_method == "UPI":
-            query = query.filter((models.Expense.payment_method == "UPI") | (models.Expense.payment_method == "UPI / Bank Transfer"))
+            query = query.filter(
+                (models.Expense.payment_method == "UPI")
+                | (models.Expense.payment_method == "UPI / Bank Transfer")
+            )
         elif payment_method == "Bank Transfer":
-            query = query.filter((models.Expense.payment_method == "Bank Transfer") | (models.Expense.payment_method == "UPI / Bank Transfer"))
+            query = query.filter(
+                (models.Expense.payment_method == "Bank Transfer")
+                | (models.Expense.payment_method == "UPI / Bank Transfer")
+            )
         else:
             query = query.filter(models.Expense.payment_method == payment_method)
 
@@ -57,12 +109,21 @@ def get_expenses(
     return query.all()
 
 
-def get_expense_by_id(db: Session, expense_id: int) -> Optional[models.Expense]:
-    return db.query(models.Expense).filter(models.Expense.id == expense_id).first()
+def get_expense_by_id(db: Session, expense_id: int, user_id: int) -> Optional[models.Expense]:
+    """Retrieve a single expense ensuring ownership by user_id."""
+    return (
+        db.query(models.Expense)
+        .filter(models.Expense.id == expense_id, models.Expense.user_id == user_id)
+        .first()
+    )
 
 
-def create_expense(db: Session, expense_data: schemas.ExpenseCreate) -> models.Expense:
+def create_expense(
+    db: Session, expense_data: schemas.ExpenseCreate, user_id: int
+) -> models.Expense:
+    """Create a new expense associated with the authenticated user."""
     db_expense = models.Expense(
+        user_id=user_id,
         amount=expense_data.amount,
         description=expense_data.description,
         category=expense_data.category,
@@ -76,9 +137,10 @@ def create_expense(db: Session, expense_data: schemas.ExpenseCreate) -> models.E
 
 
 def update_expense(
-    db: Session, expense_id: int, expense_data: schemas.ExpenseUpdate
+    db: Session, expense_id: int, expense_data: schemas.ExpenseUpdate, user_id: int
 ) -> Optional[models.Expense]:
-    db_expense = get_expense_by_id(db, expense_id)
+    """Update an existing expense owned by user_id."""
+    db_expense = get_expense_by_id(db, expense_id, user_id=user_id)
     if not db_expense:
         return None
 
@@ -91,8 +153,9 @@ def update_expense(
     return db_expense
 
 
-def delete_expense(db: Session, expense_id: int) -> bool:
-    db_expense = get_expense_by_id(db, expense_id)
+def delete_expense(db: Session, expense_id: int, user_id: int) -> bool:
+    """Delete an expense by ID only if it belongs to user_id."""
+    db_expense = get_expense_by_id(db, expense_id, user_id=user_id)
     if not db_expense:
         return False
     db.delete(db_expense)
@@ -100,26 +163,46 @@ def delete_expense(db: Session, expense_id: int) -> bool:
     return True
 
 
-def bulk_delete_expenses(db: Session, ids: List[int]) -> int:
+def bulk_delete_expenses(db: Session, ids: List[int], user_id: int) -> int:
+    """Delete multiple expenses belonging strictly to user_id."""
     if not ids:
         return 0
-    deleted = db.query(models.Expense).filter(models.Expense.id.in_(ids)).delete(synchronize_session=False)
+    deleted = (
+        db.query(models.Expense)
+        .filter(models.Expense.id.in_(ids), models.Expense.user_id == user_id)
+        .delete(synchronize_session=False)
+    )
     db.commit()
     return deleted
 
 
-def get_monthly_summaries(db: Session) -> List[models.MonthlySummary]:
-    return db.query(models.MonthlySummary).order_by(desc(models.MonthlySummary.month)).all()
+# ==========================================
+# MONTHLY SUMMARIES (SCOPED TO USER)
+# ==========================================
+
+def get_monthly_summaries(db: Session, user_id: int) -> List[models.MonthlySummary]:
+    return (
+        db.query(models.MonthlySummary)
+        .filter(models.MonthlySummary.user_id == user_id)
+        .order_by(desc(models.MonthlySummary.month))
+        .all()
+    )
 
 
-def get_monthly_summary_by_month(db: Session, month: str) -> Optional[models.MonthlySummary]:
-    return db.query(models.MonthlySummary).filter(models.MonthlySummary.month == month).first()
+def get_monthly_summary_by_month(
+    db: Session, month: str, user_id: int
+) -> Optional[models.MonthlySummary]:
+    return (
+        db.query(models.MonthlySummary)
+        .filter(models.MonthlySummary.month == month, models.MonthlySummary.user_id == user_id)
+        .first()
+    )
 
 
 def upsert_monthly_summary(
-    db: Session, summary_data: schemas.MonthlySummaryCreate
+    db: Session, summary_data: schemas.MonthlySummaryCreate, user_id: int
 ) -> models.MonthlySummary:
-    existing = get_monthly_summary_by_month(db, summary_data.month)
+    existing = get_monthly_summary_by_month(db, summary_data.month, user_id=user_id)
     if existing:
         existing.total_amount = summary_data.total_amount
         if summary_data.note is not None:
@@ -130,6 +213,7 @@ def upsert_monthly_summary(
         return existing
     else:
         new_summary = models.MonthlySummary(
+            user_id=user_id,
             month=summary_data.month,
             total_amount=summary_data.total_amount,
             note=summary_data.note,
@@ -140,8 +224,8 @@ def upsert_monthly_summary(
         return new_summary
 
 
-def delete_monthly_summary(db: Session, month: str) -> bool:
-    existing = get_monthly_summary_by_month(db, month)
+def delete_monthly_summary(db: Session, month: str, user_id: int) -> bool:
+    existing = get_monthly_summary_by_month(db, month, user_id=user_id)
     if not existing:
         return False
     db.delete(existing)
@@ -149,15 +233,21 @@ def delete_monthly_summary(db: Session, month: str) -> bool:
     return True
 
 
-def get_available_months(db: Session) -> List[str]:
-    """Returns distinct YYYY-MM strings present in expenses and monthly summaries, sorted descending."""
+# ==========================================
+# METADATA & TRENDS (SCOPED TO USER)
+# ==========================================
+
+def get_available_months(db: Session, user_id: int) -> List[str]:
+    """Returns distinct YYYY-MM strings present in user's expenses and summaries."""
     expense_months = (
         db.query(func.substr(models.Expense.date, 1, 7).label("month"))
+        .filter(models.Expense.user_id == user_id)
         .distinct()
         .all()
     )
     summary_months = (
         db.query(models.MonthlySummary.month)
+        .filter(models.MonthlySummary.user_id == user_id)
         .distinct()
         .all()
     )
@@ -172,19 +262,15 @@ def get_available_months(db: Session) -> List[str]:
     return sorted(list(all_months), reverse=True)
 
 
-def get_monthly_trends(db: Session) -> List[schemas.MonthlyTrend]:
-    """
-    Computes total spending per month across the database.
-    If a MonthlySummary exists for a month, it is treated as that month's overall total
-    to avoid double-counting, while itemized metrics are preserved.
-    """
-    # 1. Fetch itemized stats by month
+def get_monthly_trends(db: Session, user_id: int) -> List[schemas.MonthlyTrend]:
+    """Computes total spending per month for user_id with monthly summary overrides."""
     expense_results = (
         db.query(
             func.substr(models.Expense.date, 1, 7).label("month"),
             func.sum(models.Expense.amount).label("total"),
             func.count(models.Expense.id).label("count"),
         )
+        .filter(models.Expense.user_id == user_id)
         .group_by("month")
         .all()
     )
@@ -197,11 +283,9 @@ def get_monthly_trends(db: Session) -> List[schemas.MonthlyTrend]:
                 "count": int(row[2] or 0),
             }
 
-    # 2. Fetch all monthly summaries
-    summaries = get_monthly_summaries(db)
+    summaries = get_monthly_summaries(db, user_id=user_id)
     summary_map = {s.month: s for s in summaries}
 
-    # 3. Combine distinct months
     all_months = sorted(list(set(list(itemized_map.keys()) + list(summary_map.keys()))))
 
     trends = []
@@ -216,7 +300,6 @@ def get_monthly_trends(db: Session) -> List[schemas.MonthlyTrend]:
             month_name = month_str
 
         if summary_rec:
-            # Monthly summary overrides itemized total to prevent double-counting
             official_total = round(summary_rec.total_amount, 2)
             is_summary = True
         else:
@@ -240,13 +323,15 @@ def get_monthly_trends(db: Session) -> List[schemas.MonthlyTrend]:
 
 def get_analytics_summary(
     db: Session,
+    user_id: int,
     month: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     category: Optional[str] = None,
     payment_method: Optional[str] = None,
 ) -> schemas.AnalyticsSummaryResponse:
-    query = db.query(models.Expense)
+    """Calculates summary statistics scoped strictly to user_id."""
+    query = db.query(models.Expense).filter(models.Expense.user_id == user_id)
 
     has_specific_month = bool(month and month.lower() != "all")
     if has_specific_month:
@@ -265,16 +350,22 @@ def get_analytics_summary(
     has_pm_filter = bool(payment_method and payment_method.lower() != "all")
     if has_pm_filter:
         if payment_method == "UPI":
-            query = query.filter((models.Expense.payment_method == "UPI") | (models.Expense.payment_method == "UPI / Bank Transfer"))
+            query = query.filter(
+                (models.Expense.payment_method == "UPI")
+                | (models.Expense.payment_method == "UPI / Bank Transfer")
+            )
         elif payment_method == "Bank Transfer":
-            query = query.filter((models.Expense.payment_method == "Bank Transfer") | (models.Expense.payment_method == "UPI / Bank Transfer"))
+            query = query.filter(
+                (models.Expense.payment_method == "Bank Transfer")
+                | (models.Expense.payment_method == "UPI / Bank Transfer")
+            )
         else:
             query = query.filter(models.Expense.payment_method == payment_method)
 
     expenses = query.all()
 
-    # Pre-calculate monthly trends across entire history
-    monthly_trends = get_monthly_trends(db)
+    # Pre-calculate monthly trends for this user
+    monthly_trends = get_monthly_trends(db, user_id=user_id)
 
     # Check for monthly summary override
     monthly_summary_rec = None
@@ -282,12 +373,13 @@ def get_analytics_summary(
     monthly_summary_response = None
 
     if has_specific_month and not start_date and not end_date and not has_cat_filter and not has_pm_filter:
-        monthly_summary_rec = get_monthly_summary_by_month(db, month)
+        monthly_summary_rec = get_monthly_summary_by_month(db, month, user_id=user_id)
         if monthly_summary_rec:
             has_monthly_summary = True
             itemized_sum = round(sum(exp.amount for exp in expenses), 2)
             monthly_summary_response = schemas.MonthlySummaryResponse(
                 id=monthly_summary_rec.id,
+                user_id=user_id,
                 month=monthly_summary_rec.month,
                 total_amount=round(monthly_summary_rec.total_amount, 2),
                 note=monthly_summary_rec.note,
@@ -301,19 +393,16 @@ def get_analytics_summary(
 
     # Determine official total spending
     if has_monthly_summary and monthly_summary_rec:
-        # Override with Monthly Summary
         total_spending = round(monthly_summary_rec.total_amount, 2)
         total_count = len(expenses)
         average_expense = round(total_spending / total_count, 2) if total_count > 0 else total_spending
         highest_expense = round(max((exp.amount for exp in expenses), default=total_spending), 2)
     elif not has_specific_month and not start_date and not end_date and not has_cat_filter and not has_pm_filter:
-        # For "All Months" with no category/payment filter: sum of official monthly totals
         total_spending = round(sum(t.total_amount for t in monthly_trends), 2)
         total_count = len(expenses)
         average_expense = round(total_spending / total_count, 2) if total_count > 0 else 0.0
         highest_expense = round(max((exp.amount for exp in expenses), default=0.0), 2)
     else:
-        # Filtered by category, payment method, or custom date range
         total_spending = itemized_spending
         total_count = len(expenses)
         average_expense = round(total_spending / total_count, 2) if total_count > 0 else 0.0
@@ -326,7 +415,6 @@ def get_analytics_summary(
         cat_dict[exp.category]["amount"] += exp.amount
         cat_dict[exp.category]["count"] += 1
 
-    # If Monthly Summary is active and greater than itemized sum, account for remainder
     category_summaries = []
     if has_monthly_summary and monthly_summary_rec and total_spending > itemized_spending:
         remainder = round(total_spending - itemized_spending, 2)
@@ -347,7 +435,6 @@ def get_analytics_summary(
     # Build Payment Method Breakdown
     pm_dict = {}
     for exp in expenses:
-        # Normalize UPI and Bank Transfer grouping
         pm = exp.payment_method
         pm_dict.setdefault(pm, {"amount": 0.0, "count": 0})
         pm_dict[pm]["amount"] += exp.amount
@@ -382,6 +469,7 @@ def get_analytics_summary(
 
 def get_period_comparison(
     db: Session,
+    user_id: int,
     current_start: str,
     current_end: str,
     prev_start: str,
@@ -389,15 +477,23 @@ def get_period_comparison(
     current_label: str = "Current Period",
     prev_label: str = "Previous Period",
 ) -> schemas.PeriodComparisonResponse:
-    """Compares spending between two distinct date periods."""
+    """Compares spending between two distinct date periods for user_id."""
     curr_expenses = (
         db.query(models.Expense)
-        .filter(models.Expense.date >= current_start, models.Expense.date <= current_end)
+        .filter(
+            models.Expense.user_id == user_id,
+            models.Expense.date >= current_start,
+            models.Expense.date <= current_end,
+        )
         .all()
     )
     prev_expenses = (
         db.query(models.Expense)
-        .filter(models.Expense.date >= prev_start, models.Expense.date <= prev_end)
+        .filter(
+            models.Expense.user_id == user_id,
+            models.Expense.date >= prev_start,
+            models.Expense.date <= prev_end,
+        )
         .all()
     )
 
@@ -411,7 +507,6 @@ def get_period_comparison(
     else:
         pct_change = 0.0
 
-    # Category comparison
     curr_cat = {}
     for e in curr_expenses:
         curr_cat[e.category] = curr_cat.get(e.category, 0.0) + e.amount
@@ -458,19 +553,30 @@ def get_period_comparison(
 
 
 # ==========================================
-# STAGE 2: BUDGETS CRUD
+# BUDGETS CRUD (SCOPED TO USER)
 # ==========================================
 
-def get_budget_by_month(db: Session, month: str) -> Optional[models.Budget]:
-    return db.query(models.Budget).filter(models.Budget.month == month).first()
+def get_budget_by_month(db: Session, month: str, user_id: int) -> Optional[models.Budget]:
+    return (
+        db.query(models.Budget)
+        .filter(models.Budget.month == month, models.Budget.user_id == user_id)
+        .first()
+    )
 
 
-def get_budgets(db: Session) -> List[models.Budget]:
-    return db.query(models.Budget).order_by(desc(models.Budget.month)).all()
+def get_budgets(db: Session, user_id: int) -> List[models.Budget]:
+    return (
+        db.query(models.Budget)
+        .filter(models.Budget.user_id == user_id)
+        .order_by(desc(models.Budget.month))
+        .all()
+    )
 
 
-def upsert_budget(db: Session, budget_in: schemas.BudgetCreate) -> models.Budget:
-    existing = get_budget_by_month(db, budget_in.month)
+def upsert_budget(
+    db: Session, budget_in: schemas.BudgetCreate, user_id: int
+) -> models.Budget:
+    existing = get_budget_by_month(db, budget_in.month, user_id=user_id)
     cat_limits_json = json.dumps(budget_in.category_limits or {})
 
     if existing:
@@ -481,19 +587,20 @@ def upsert_budget(db: Session, budget_in: schemas.BudgetCreate) -> models.Budget
         db.refresh(existing)
         return existing
     else:
-        new_budget = models.Budget(
+        new_b = models.Budget(
+            user_id=user_id,
             month=budget_in.month,
             overall_limit=budget_in.overall_limit,
             category_limits=cat_limits_json,
         )
-        db.add(new_budget)
+        db.add(new_b)
         db.commit()
-        db.refresh(new_budget)
-        return new_budget
+        db.refresh(new_b)
+        return new_b
 
 
-def delete_budget(db: Session, month: str) -> bool:
-    existing = get_budget_by_month(db, month)
+def delete_budget(db: Session, month: str, user_id: int) -> bool:
+    existing = get_budget_by_month(db, month, user_id=user_id)
     if not existing:
         return False
     db.delete(existing)
@@ -501,90 +608,75 @@ def delete_budget(db: Session, month: str) -> bool:
     return True
 
 
-def build_budget_response(db: Session, budget: models.Budget) -> schemas.BudgetResponse:
-    # 1. Calculate actual spending in that month (using monthly summary override if present)
-    ms = get_monthly_summary_by_month(db, budget.month)
-    expenses = get_expenses(db, month=budget.month)
-    itemized_spent = round(sum(e.amount for e in expenses), 2)
-    overall_spent = ms.total_amount if ms else itemized_spent
-
-    overall_remaining = round(budget.overall_limit - overall_spent, 2)
+def build_budget_response(
+    db: Session, budget: models.Budget, user_id: int
+) -> schemas.BudgetResponse:
+    expenses = get_expenses(db, user_id=user_id, month=budget.month)
+    total_spent = round(sum(e.amount for e in expenses), 2)
     overall_pct = (
-        round((overall_spent / budget.overall_limit) * 100, 1)
+        round((total_spent / budget.overall_limit) * 100, 1)
         if budget.overall_limit > 0
         else 0.0
     )
 
-    if overall_pct >= 100.0:
-        overall_status = "exceeded"
-    elif overall_pct >= 80.0:
-        overall_status = "warning"
-    else:
-        overall_status = "ok"
+    overall_status = "exceeded" if total_spent > budget.overall_limit else ("warning" if overall_pct >= 85 else "ok")
 
-    # Category breakdown
-    cat_limits_raw = {}
+    limits_dict = {}
     if budget.category_limits:
         try:
-            cat_limits_raw = json.loads(budget.category_limits)
+            limits_dict = json.loads(budget.category_limits)
         except Exception:
-            cat_limits_raw = {}
+            limits_dict = {}
 
-    cat_spent_map = {}
-    for exp in expenses:
-        cat_spent_map[exp.category] = cat_spent_map.get(exp.category, 0.0) + exp.amount
+    cat_spending = {}
+    for e in expenses:
+        cat_spending[e.category] = cat_spending.get(e.category, 0.0) + e.amount
 
-    category_limits_list = []
-    for cat_name, limit_val in cat_limits_raw.items():
-        if limit_val and float(limit_val) > 0:
-            limit_float = round(float(limit_val), 2)
-            c_spent = round(cat_spent_map.get(cat_name, 0.0), 2)
-            c_remaining = round(limit_float - c_spent, 2)
-            c_pct = round((c_spent / limit_float) * 100, 1)
-            if c_pct >= 100.0:
-                c_status = "exceeded"
-            elif c_pct >= 80.0:
-                c_status = "warning"
-            else:
-                c_status = "ok"
-
-            category_limits_list.append(
-                schemas.BudgetCategoryLimit(
-                    category=cat_name,
-                    limit=limit_float,
-                    spent=c_spent,
-                    remaining=c_remaining,
-                    percentage=c_pct,
-                    status=c_status,
-                )
+    category_progress_list = []
+    for cat, limit in limits_dict.items():
+        spent = round(cat_spending.get(cat, 0.0), 2)
+        pct = round((spent / limit) * 100, 1) if limit > 0 else 0.0
+        rem = round(limit - spent, 2)
+        cat_status = "exceeded" if spent > limit else ("warning" if pct >= 85 else "ok")
+        category_progress_list.append(
+            schemas.BudgetCategoryLimit(
+                category=cat,
+                limit=limit,
+                spent=spent,
+                remaining=rem,
+                percentage=pct,
+                status=cat_status,
             )
+        )
 
     return schemas.BudgetResponse(
         id=budget.id,
+        user_id=user_id,
         month=budget.month,
         overall_limit=budget.overall_limit,
-        overall_spent=overall_spent,
-        overall_remaining=overall_remaining,
+        overall_spent=total_spent,
+        overall_remaining=round(budget.overall_limit - total_spent, 2),
         overall_percentage=overall_pct,
         overall_status=overall_status,
-        category_limits=category_limits_list,
+        category_limits=category_progress_list,
         created_at=budget.created_at,
         updated_at=budget.updated_at,
     )
 
 
 # ==========================================
-# STAGE 2: INCOME CRUD
+# INCOME CRUD (SCOPED TO USER)
 # ==========================================
 
 def get_incomes(
     db: Session,
+    user_id: int,
     month: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     source: Optional[str] = None,
 ) -> List[models.Income]:
-    query = db.query(models.Income)
+    query = db.query(models.Income).filter(models.Income.user_id == user_id)
     if month and month.lower() != "all":
         query = query.filter(models.Income.date.startswith(month))
     if start_date:
@@ -593,136 +685,130 @@ def get_incomes(
         query = query.filter(models.Income.date <= end_date)
     if source and source.lower() != "all":
         query = query.filter(models.Income.source == source)
-
-    return query.order_by(desc(models.Income.date), desc(models.Income.id)).all()
-
-
-def get_income_by_id(db: Session, income_id: int) -> Optional[models.Income]:
-    return db.query(models.Income).filter(models.Income.id == income_id).first()
+    return query.order_by(desc(models.Income.date)).all()
 
 
-def create_income(db: Session, income_in: schemas.IncomeCreate) -> models.Income:
-    rec = models.Income(
+def get_income_by_id(db: Session, income_id: int, user_id: int) -> Optional[models.Income]:
+    return (
+        db.query(models.Income)
+        .filter(models.Income.id == income_id, models.Income.user_id == user_id)
+        .first()
+    )
+
+
+def create_income(
+    db: Session, income_in: schemas.IncomeCreate, user_id: int
+) -> models.Income:
+    income = models.Income(
+        user_id=user_id,
         amount=income_in.amount,
         source=income_in.source,
         date=income_in.date,
         description=income_in.description,
     )
-    db.add(rec)
+    db.add(income)
     db.commit()
-    db.refresh(rec)
-    return rec
+    db.refresh(income)
+    return income
 
 
 def update_income(
-    db: Session, income_id: int, income_in: schemas.IncomeUpdate
+    db: Session, income_id: int, income_in: schemas.IncomeUpdate, user_id: int
 ) -> Optional[models.Income]:
-    rec = get_income_by_id(db, income_id)
-    if not rec:
+    income = get_income_by_id(db, income_id, user_id=user_id)
+    if not income:
         return None
-    if income_in.amount is not None:
-        rec.amount = income_in.amount
-    if income_in.source is not None:
-        rec.source = income_in.source
-    if income_in.date is not None:
-        rec.date = income_in.date
-    if income_in.description is not None:
-        rec.description = income_in.description
+    for field, val in income_in.model_dump(exclude_unset=True).items():
+        setattr(income, field, val)
     db.commit()
-    db.refresh(rec)
-    return rec
+    db.refresh(income)
+    return income
 
 
-def delete_income(db: Session, income_id: int) -> bool:
-    rec = get_income_by_id(db, income_id)
-    if not rec:
+def delete_income(db: Session, income_id: int, user_id: int) -> bool:
+    income = get_income_by_id(db, income_id, user_id=user_id)
+    if not income:
         return False
-    db.delete(rec)
+    db.delete(income)
     db.commit()
     return True
 
 
 def get_cash_flow_summary(
     db: Session,
+    user_id: int,
     month: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> schemas.CashFlowSummaryResponse:
-    incomes = get_incomes(db, month=month, start_date=start_date, end_date=end_date)
-    total_income = round(sum(i.amount for i in incomes), 2)
+    incomes = get_incomes(db, user_id=user_id, month=month, start_date=start_date, end_date=end_date)
+    expenses = get_expenses(db, user_id=user_id, month=month, start_date=start_date, end_date=end_date)
 
-    expenses_summary = get_analytics_summary(
-        db, month=month, start_date=start_date, end_date=end_date
-    )
-    total_expenses = expenses_summary.total_spending
+    tot_income = round(sum(i.amount for i in incomes), 2)
+    tot_expenses = round(sum(e.amount for e in expenses), 2)
+    net_bal = round(tot_income - tot_expenses, 2)
+    savings_rate = round((net_bal / tot_income) * 100, 1) if tot_income > 0 else 0.0
 
-    net_balance = round(total_income - total_expenses, 2)
-    savings_rate = (
-        round((net_balance / total_income) * 100, 1) if total_income > 0 else 0.0
-    )
+    # Source breakdown
+    src_map = {}
+    for i in incomes:
+        if i.source not in src_map:
+            src_map[i.source] = {"amount": 0.0, "count": 0}
+        src_map[i.source]["amount"] += i.amount
+        src_map[i.source]["count"] += 1
 
-    source_map = {}
-    for inc in incomes:
-        source_map.setdefault(inc.source, {"amount": 0.0, "count": 0})
-        source_map[inc.source]["amount"] += inc.amount
-        source_map[inc.source]["count"] += 1
-
-    source_summaries = []
-    for s_name, s_data in sorted(
-        source_map.items(), key=lambda x: x[1]["amount"], reverse=True
-    ):
-        s_amt = round(s_data["amount"], 2)
-        s_pct = round((s_amt / total_income) * 100, 1) if total_income > 0 else 0.0
-        source_summaries.append(
-            schemas.IncomeSourceSummary(
-                source=s_name,
-                total_amount=s_amt,
-                percentage=s_pct,
-                count=s_data["count"],
-            )
+    sources = [
+        schemas.IncomeSourceSummary(
+            source=s,
+            total_amount=round(data["amount"], 2),
+            percentage=round((data["amount"] / tot_income) * 100, 1) if tot_income > 0 else 0.0,
+            count=data["count"],
         )
+        for s, data in src_map.items()
+    ]
 
-    period_str = month or (
-        f"{start_date} to {end_date}" if start_date and end_date else "All Time"
-    )
-
+    label = month or (f"{start_date} to {end_date}" if start_date and end_date else "All Time")
     return schemas.CashFlowSummaryResponse(
-        period_label=period_str,
-        total_income=total_income,
-        total_expenses=total_expenses,
-        net_balance=net_balance,
+        period_label=label,
+        total_income=tot_income,
+        total_expenses=tot_expenses,
+        net_balance=net_bal,
         savings_rate=savings_rate,
-        income_sources=source_summaries,
+        income_sources=sources,
     )
 
 
 # ==========================================
-# STAGE 2: RECURRING EXPENSES CRUD
+# RECURRING EXPENSES CRUD (SCOPED TO USER)
 # ==========================================
 
 def get_recurring_expenses(
-    db: Session, status: Optional[str] = None
+    db: Session, user_id: int, status: Optional[str] = None
 ) -> List[models.RecurringExpense]:
-    query = db.query(models.RecurringExpense)
+    query = db.query(models.RecurringExpense).filter(models.RecurringExpense.user_id == user_id)
     if status and status.lower() != "all":
         query = query.filter(models.RecurringExpense.status == status)
     return query.order_by(asc(models.RecurringExpense.next_due_date)).all()
 
 
 def get_recurring_expense_by_id(
-    db: Session, recurring_id: int
+    db: Session, recurring_id: int, user_id: int
 ) -> Optional[models.RecurringExpense]:
     return (
         db.query(models.RecurringExpense)
-        .filter(models.RecurringExpense.id == recurring_id)
+        .filter(
+            models.RecurringExpense.id == recurring_id,
+            models.RecurringExpense.user_id == user_id,
+        )
         .first()
     )
 
 
 def create_recurring_expense(
-    db: Session, rec_in: schemas.RecurringExpenseCreate
+    db: Session, rec_in: schemas.RecurringExpenseCreate, user_id: int
 ) -> models.RecurringExpense:
     rec = models.RecurringExpense(
+        user_id=user_id,
         amount=rec_in.amount,
         description=rec_in.description,
         category=rec_in.category,
@@ -739,9 +825,12 @@ def create_recurring_expense(
 
 
 def update_recurring_expense(
-    db: Session, recurring_id: int, rec_in: schemas.RecurringExpenseUpdate
+    db: Session,
+    recurring_id: int,
+    rec_in: schemas.RecurringExpenseUpdate,
+    user_id: int,
 ) -> Optional[models.RecurringExpense]:
-    rec = get_recurring_expense_by_id(db, recurring_id)
+    rec = get_recurring_expense_by_id(db, recurring_id, user_id=user_id)
     if not rec:
         return None
     for field, val in rec_in.model_dump(exclude_unset=True).items():
@@ -751,8 +840,8 @@ def update_recurring_expense(
     return rec
 
 
-def delete_recurring_expense(db: Session, recurring_id: int) -> bool:
-    rec = get_recurring_expense_by_id(db, recurring_id)
+def delete_recurring_expense(db: Session, recurring_id: int, user_id: int) -> bool:
+    rec = get_recurring_expense_by_id(db, recurring_id, user_id=user_id)
     if not rec:
         return False
     db.delete(rec)
@@ -761,9 +850,9 @@ def delete_recurring_expense(db: Session, recurring_id: int) -> bool:
 
 
 def toggle_recurring_status(
-    db: Session, recurring_id: int, new_status: str
+    db: Session, recurring_id: int, new_status: str, user_id: int
 ) -> Optional[models.RecurringExpense]:
-    rec = get_recurring_expense_by_id(db, recurring_id)
+    rec = get_recurring_expense_by_id(db, recurring_id, user_id=user_id)
     if not rec:
         return None
     rec.status = new_status
@@ -798,14 +887,14 @@ def advance_due_date(current_due_str: str, frequency: str) -> str:
 
 
 def record_due_expense(
-    db: Session, recurring_id: int
+    db: Session, recurring_id: int, user_id: int
 ) -> Tuple[Optional[models.Expense], Optional[models.RecurringExpense]]:
-    rec = get_recurring_expense_by_id(db, recurring_id)
+    rec = get_recurring_expense_by_id(db, recurring_id, user_id=user_id)
     if not rec:
         return None, None
 
-    # Create actual itemized expense
     expense = models.Expense(
+        user_id=user_id,
         amount=rec.amount,
         description=f"{rec.description} (Auto)",
         category=rec.category,
@@ -813,10 +902,7 @@ def record_due_expense(
         date=rec.next_due_date,
     )
     db.add(expense)
-
-    # Advance next due date
     rec.next_due_date = advance_due_date(rec.next_due_date, rec.frequency)
-
     db.commit()
     db.refresh(expense)
     db.refresh(rec)
@@ -824,26 +910,33 @@ def record_due_expense(
 
 
 # ==========================================
-# STAGE 2: SAVINGS GOALS CRUD
+# SAVINGS GOALS CRUD (SCOPED TO USER)
 # ==========================================
 
 def get_savings_goals(
-    db: Session, status: Optional[str] = None
+    db: Session, user_id: int, status: Optional[str] = None
 ) -> List[models.SavingsGoal]:
-    query = db.query(models.SavingsGoal)
+    query = db.query(models.SavingsGoal).filter(models.SavingsGoal.user_id == user_id)
     if status and status.lower() != "all":
         query = query.filter(models.SavingsGoal.status == status)
     return query.order_by(asc(models.SavingsGoal.target_date)).all()
 
 
-def get_savings_goal_by_id(db: Session, goal_id: int) -> Optional[models.SavingsGoal]:
-    return db.query(models.SavingsGoal).filter(models.SavingsGoal.id == goal_id).first()
+def get_savings_goal_by_id(
+    db: Session, goal_id: int, user_id: int
+) -> Optional[models.SavingsGoal]:
+    return (
+        db.query(models.SavingsGoal)
+        .filter(models.SavingsGoal.id == goal_id, models.SavingsGoal.user_id == user_id)
+        .first()
+    )
 
 
 def create_savings_goal(
-    db: Session, goal_in: schemas.SavingsGoalCreate
+    db: Session, goal_in: schemas.SavingsGoalCreate, user_id: int
 ) -> models.SavingsGoal:
     goal = models.SavingsGoal(
+        user_id=user_id,
         title=goal_in.title,
         target_amount=goal_in.target_amount,
         current_amount=goal_in.current_amount,
@@ -859,9 +952,9 @@ def create_savings_goal(
 
 
 def update_savings_goal(
-    db: Session, goal_id: int, goal_in: schemas.SavingsGoalUpdate
+    db: Session, goal_id: int, goal_in: schemas.SavingsGoalUpdate, user_id: int
 ) -> Optional[models.SavingsGoal]:
-    goal = get_savings_goal_by_id(db, goal_id)
+    goal = get_savings_goal_by_id(db, goal_id, user_id=user_id)
     if not goal:
         return None
     for field, val in goal_in.model_dump(exclude_unset=True).items():
@@ -872,8 +965,8 @@ def update_savings_goal(
     return goal
 
 
-def delete_savings_goal(db: Session, goal_id: int) -> bool:
-    goal = get_savings_goal_by_id(db, goal_id)
+def delete_savings_goal(db: Session, goal_id: int, user_id: int) -> bool:
+    goal = get_savings_goal_by_id(db, goal_id, user_id=user_id)
     if not goal:
         return False
     db.delete(goal)
@@ -882,9 +975,9 @@ def delete_savings_goal(db: Session, goal_id: int) -> bool:
 
 
 def contribute_to_goal(
-    db: Session, goal_id: int, amount: float
+    db: Session, goal_id: int, amount: float, user_id: int
 ) -> Optional[models.SavingsGoal]:
-    goal = get_savings_goal_by_id(db, goal_id)
+    goal = get_savings_goal_by_id(db, goal_id, user_id=user_id)
     if not goal:
         return None
     goal.current_amount = round(goal.current_amount + amount, 2)
@@ -905,6 +998,7 @@ def build_savings_goal_response(goal: models.SavingsGoal) -> schemas.SavingsGoal
     rem = max(0.0, round(goal.target_amount - goal.current_amount, 2))
     return schemas.SavingsGoalResponse(
         id=goal.id,
+        user_id=goal.user_id,
         title=goal.title,
         target_amount=goal.target_amount,
         current_amount=goal.current_amount,
@@ -917,4 +1011,3 @@ def build_savings_goal_response(goal: models.SavingsGoal) -> schemas.SavingsGoal
         created_at=goal.created_at,
         updated_at=goal.updated_at,
     )
-

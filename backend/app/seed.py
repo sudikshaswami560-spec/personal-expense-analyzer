@@ -9,6 +9,9 @@ def seed_sample_expenses_if_empty(db: Session):
     if existing_count > 0:
         return
 
+    default_user = db.query(models.User).order_by(models.User.id.asc()).first()
+    default_user_id = default_user.id if default_user else 1
+
     today = date.today()
     # Helper to calculate relative date
     def days_ago(d: int) -> str:
@@ -102,8 +105,9 @@ def seed_sample_expenses_if_empty(db: Session):
     ]
 
     for item in sample_data:
-        expense = models.Expense(**item)
+        expense = models.Expense(**item, user_id=default_user_id)
         db.add(expense)
 
     db.commit()
-    print(f"Successfully seeded {len(sample_data)} sample expenses.")
+    print(f"Successfully seeded {len(sample_data)} sample expenses for user {default_user_id}.")
+

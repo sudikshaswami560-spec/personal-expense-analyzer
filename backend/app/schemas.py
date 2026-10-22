@@ -26,6 +26,52 @@ PAYMENT_METHODS = [
 ]
 
 
+class UserCreate(BaseModel):
+    email: str = Field(..., min_length=3, max_length=255)
+    password: str = Field(..., min_length=6, max_length=128)
+    full_name: Optional[str] = Field(None, max_length=100)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        trimmed = v.strip().lower()
+        if "@" not in trimmed or "." not in trimmed:
+            raise ValueError("Invalid email address")
+        return trimmed
+
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        return v.strip().lower()
+
+
+class UserResponse(BaseModel):
+    id: int
+    email: str
+    full_name: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+
+class TokenData(BaseModel):
+    user_id: Optional[int] = None
+    email: Optional[str] = None
+
+
+
 class ExpenseBase(BaseModel):
     amount: float = Field(..., gt=0, description="Expense amount must be greater than 0")
     description: str = Field(..., min_length=1, max_length=255, description="Brief description of the expense")
@@ -105,6 +151,7 @@ class ExpenseUpdate(BaseModel):
 
 class ExpenseResponse(ExpenseBase):
     id: int
+    user_id: Optional[int] = None
     created_at: Optional[datetime] = None
 
     class Config:
@@ -154,6 +201,7 @@ class MonthlySummaryUpdate(BaseModel):
 
 class MonthlySummaryResponse(MonthlySummaryBase):
     id: int
+    user_id: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     itemized_total: Optional[float] = None
@@ -283,6 +331,7 @@ class BudgetCreate(BaseModel):
 
 class BudgetResponse(BaseModel):
     id: int
+    user_id: Optional[int] = None
     month: str
     overall_limit: float
     overall_spent: float = 0.0
@@ -339,6 +388,7 @@ class IncomeUpdate(BaseModel):
 
 class IncomeResponse(IncomeBase):
     id: int
+    user_id: Optional[int] = None
     created_at: datetime
 
 
@@ -386,6 +436,7 @@ class RecurringExpenseUpdate(BaseModel):
 
 class RecurringExpenseResponse(RecurringExpenseBase):
     id: int
+    user_id: Optional[int] = None
     created_at: datetime
 
 
@@ -415,6 +466,7 @@ class SavingsGoalUpdate(BaseModel):
 
 class SavingsGoalResponse(SavingsGoalBase):
     id: int
+    user_id: Optional[int] = None
     percentage_complete: float = 0.0
     remaining_amount: float = 0.0
     created_at: datetime
