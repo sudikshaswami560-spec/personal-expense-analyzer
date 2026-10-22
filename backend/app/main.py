@@ -4,7 +4,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, Query, status
-from fastapi.responses import Response
+from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 import openpyxl
@@ -12,34 +12,27 @@ from openpyxl.styles import Font, PatternFill, Alignment
 
 from .database import engine, Base, get_db, SessionLocal
 from . import models, schemas, crud
-from .migration import run_database_migrations
 from .seed import seed_sample_expenses_if_empty
-from .auth import (
-    create_access_token,
-    get_current_user,
-    get_current_user_with_query_fallback,
-    decode_token,
-    security,
-)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Safe schema migration executed FIRST before any query runs
-    run_database_migrations()
+    # Startup: create tables and seed initial sample data if empty
+    Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
         seed_sample_expenses_if_empty(db)
     yield
+    # Shutdown logic (if any)
 
 
 app = FastAPI(
     title="Personal Expense Analyzer API",
-    description="A secure multi-tenant REST API for recording and analyzing personal expenses.",
-    version="1.1.0",
+    description="A clean REST API for recording and analyzing personal expenses.",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
-# CORS setup
+# CORS setup: supports local development, production Vercel domains, and configurable origins via environment variables
 cors_env = os.getenv("CORS_ORIGINS", "")
 if cors_env:
     allowed_origins = [orig.strip() for orig in cors_env.split(",") if orig.strip()]
@@ -62,16 +55,12 @@ if frontend_url:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_origin_regex=r"https://.*\.vercel\.app",  # Automatically permits all Vercel domains
+    allow_origin_regex=r"https://.*\.vercel\.app",  # Automatically permits all Vercel production & preview domains
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ==========================================
-# GENERAL & HEALTH
-# ==========================================
 
 @app.get("/", tags=["General"])
 def read_root():
@@ -80,7 +69,6 @@ def read_root():
         "status": "online",
         "documentation": "/docs",
         "health": "/api/health",
-        "version": "1.1.0 (Multi-User Secure)",
     }
 
 
@@ -89,92 +77,10 @@ def health_check():
     return {"status": "healthy"}
 
 
-# ==========================================
-# AUTHENTICATION ENDPOINTS
-# ==========================================
-
-@app.post(
-    "/api/auth/register",
-    response_model=schemas.Token,
-    status_code=status.HTTP_201_CREATED,
-    tags=["Authentication"],
-)
-def register(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
-    """Register a new private user account."""
-    existing_user = crud.get_user_by_email(db, user_in.email)
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="An account with this email address already exists.",
-        )
-
-    user = crud.create_user(db, user_in)
-    access_token = create_access_token(data={"sub": str(user.id), "email": user.email})
-    return schemas.Token(
-        access_token=access_token,
-        token_type="bearer",
-        user=schemas.UserResponse.model_validate(user),
-    )
-
-
-@app.post(
-    "/api/auth/login",
-    response_model=schemas.Token,
-    tags=["Authentication"],
-)
-def login(login_data: schemas.UserLogin, db: Session = Depends(get_db)):
-    """Authenticate with email and password to receive a secure JWT token."""
-    user = crud.authenticate_user(db, login_data.email, login_data.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    access_token = create_access_token(data={"sub": str(user.id), "email": user.email})
-    return schemas.Token(
-        access_token=access_token,
-        token_type="bearer",
-        user=schemas.UserResponse.model_validate(user),
-    )
-
-
-@app.get(
-    "/api/auth/me",
-    response_model=schemas.UserResponse,
-    tags=["Authentication"],
-)
-def get_me(current_user: models.User = Depends(get_current_user)):
-    """Get profile of current authenticated user."""
-    return current_user
-
-
-# ==========================================
-# METADATA ENDPOINT
-# ==========================================
-
 @app.get("/api/meta", tags=["Metadata"])
-def get_metadata(
-    db: Session = Depends(get_db),
-    credentials=Depends(security),
-):
-    """Returns available categories, payment methods, and user's recorded months."""
-    user_id = None
-    if credentials and credentials.credentials:
-        payload = decode_token(credentials.credentials)
-        if payload and payload.get("sub"):
-            try:
-                user_id = int(payload["sub"])
-            except ValueError:
-                pass
-
-    if user_id:
-        recorded_months = crud.get_available_months(db, user_id=user_id)
-    else:
-        # Fallback to any recorded months if unauthenticated
-        recorded_months = []
-
+def get_metadata(db: Session = Depends(get_db)):
+    """Returns available categories, payment methods, and distinct months with records."""
+    recorded_months = crud.get_available_months(db)
     return {
         "categories": schemas.CATEGORIES,
         "payment_methods": schemas.PAYMENT_METHODS,
@@ -182,10 +88,6 @@ def get_metadata(
         "income_sources": schemas.INCOME_SOURCES,
     }
 
-
-# ==========================================
-# EXPENSES ENDPOINTS (SCOPED TO CURRENT USER)
-# ==========================================
 
 @app.get("/api/expenses", response_model=List[schemas.ExpenseResponse], tags=["Expenses"])
 def list_expenses(
@@ -197,13 +99,11 @@ def list_expenses(
     search: Optional[str] = Query(None, description="Search description or category"),
     sort_by: str = Query("date", description="Sort by field: date or amount"),
     sort_order: str = Query("desc", description="Sort order: asc or desc"),
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Retrieve expenses strictly belonging to the authenticated user."""
+    """Retrieve expenses with optional filtering by month, date range, category, payment method, or search query."""
     return crud.get_expenses(
         db=db,
-        user_id=current_user.id,
         month=month,
         start_date=start_date,
         end_date=end_date,
@@ -223,11 +123,10 @@ def list_expenses(
 )
 def add_expense(
     expense_data: schemas.ExpenseCreate,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Add a new expense linked strictly to the authenticated user."""
-    return crud.create_expense(db=db, expense_data=expense_data, user_id=current_user.id)
+    """Add a new expense."""
+    return crud.create_expense(db=db, expense_data=expense_data)
 
 
 @app.post(
@@ -238,11 +137,10 @@ def add_expense(
 )
 def bulk_delete_expenses(
     payload: schemas.BulkDeleteRequest,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Delete multiple selected expenses belonging strictly to the authenticated user."""
-    deleted_count = crud.bulk_delete_expenses(db=db, ids=payload.ids, user_id=current_user.id)
+    """Delete multiple selected expenses by ID."""
+    deleted_count = crud.bulk_delete_expenses(db=db, ids=payload.ids)
     return schemas.BulkDeleteResponse(
         deleted_count=deleted_count,
         ids=payload.ids,
@@ -253,11 +151,10 @@ def bulk_delete_expenses(
 @app.get("/api/expenses/{expense_id}", response_model=schemas.ExpenseResponse, tags=["Expenses"])
 def get_expense(
     expense_id: int,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Get single expense owned by the authenticated user."""
-    expense = crud.get_expense_by_id(db=db, expense_id=expense_id, user_id=current_user.id)
+    """Get single expense by its ID."""
+    expense = crud.get_expense_by_id(db=db, expense_id=expense_id)
     if not expense:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -270,13 +167,10 @@ def get_expense(
 def update_expense(
     expense_id: int,
     expense_data: schemas.ExpenseUpdate,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Update an existing expense owned by the authenticated user."""
-    updated = crud.update_expense(
-        db=db, expense_id=expense_id, expense_data=expense_data, user_id=current_user.id
-    )
+    """Update an existing expense."""
+    updated = crud.update_expense(db=db, expense_id=expense_id, expense_data=expense_data)
     if not updated:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -288,11 +182,10 @@ def update_expense(
 @app.delete("/api/expenses/{expense_id}", status_code=status.HTTP_200_OK, tags=["Expenses"])
 def delete_expense(
     expense_id: int,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Delete an expense by ID owned by the authenticated user."""
-    deleted = crud.delete_expense(db=db, expense_id=expense_id, user_id=current_user.id)
+    """Delete an expense by ID."""
+    deleted = crud.delete_expense(db=db, expense_id=expense_id)
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -300,10 +193,6 @@ def delete_expense(
         )
     return {"message": f"Expense {expense_id} deleted successfully", "id": expense_id}
 
-
-# ==========================================
-# ANALYTICS ENDPOINTS (SCOPED TO USER)
-# ==========================================
 
 @app.get(
     "/api/analytics/summary",
@@ -316,13 +205,11 @@ def get_summary(
     end_date: Optional[str] = Query(None, description="Filter end date YYYY-MM-DD"),
     category: Optional[str] = Query(None, description="Filter summary by category"),
     payment_method: Optional[str] = Query(None, description="Filter summary by payment method"),
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Get aggregate statistics scoped strictly to the authenticated user."""
+    """Get aggregate statistics: total spending, count, average, category breakdown, monthly trends."""
     return crud.get_analytics_summary(
         db=db,
-        user_id=current_user.id,
         month=month,
         start_date=start_date,
         end_date=end_date,
@@ -343,13 +230,11 @@ def compare_periods(
     prev_end: str = Query(..., description="Previous period end date YYYY-MM-DD"),
     current_label: str = Query("Current Period", description="Display label for current period"),
     prev_label: str = Query("Previous Period", description="Display label for previous period"),
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Compares spending between two date periods for the authenticated user."""
+    """Compares spending between two date periods, calculating deltas in INR and percentages."""
     return crud.get_period_comparison(
         db=db,
-        user_id=current_user.id,
         current_start=current_start,
         current_end=current_end,
         prev_start=prev_start,
@@ -358,10 +243,6 @@ def compare_periods(
         prev_label=prev_label,
     )
 
-
-# ==========================================
-# EXPORT ENDPOINTS (SCOPED TO USER)
-# ==========================================
 
 @app.get("/api/export/expenses", tags=["Export"])
 def export_expenses(
@@ -372,13 +253,11 @@ def export_expenses(
     category: Optional[str] = Query(None),
     payment_method: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
-    current_user: models.User = Depends(get_current_user_with_query_fallback),
     db: Session = Depends(get_db),
 ):
-    """Export expenses as a downloadable CSV or Excel spreadsheet for the authenticated user."""
+    """Export expenses as a downloadable CSV or Excel spreadsheet."""
     expenses = crud.get_expenses(
         db=db,
-        user_id=current_user.id,
         month=month,
         start_date=start_date,
         end_date=end_date,
@@ -419,7 +298,7 @@ def export_expenses(
         )
     else:
         output = io.StringIO()
-        output.write("\ufeff")  # UTF-8 BOM
+        output.write("\ufeff")  # UTF-8 BOM for clean Excel viewing
         writer = csv.writer(output)
         writer.writerow(["Transaction ID", "Date", "Description", "Category", "Payment Method", "Amount (INR)"])
         for exp in expenses:
@@ -438,16 +317,11 @@ def export_summary(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     format: str = Query("csv"),
-    current_user: models.User = Depends(get_current_user_with_query_fallback),
     db: Session = Depends(get_db),
 ):
-    """Export spending overview & category breakdown as CSV or Excel for the authenticated user."""
+    """Export spending overview & category breakdown as CSV or Excel."""
     summary = crud.get_analytics_summary(
-        db=db,
-        user_id=current_user.id,
-        month=month,
-        start_date=start_date,
-        end_date=end_date,
+        db=db, month=month, start_date=start_date, end_date=end_date
     )
 
     if format.lower() == "excel":
@@ -527,28 +401,21 @@ def export_summary(
         )
 
 
-# ==========================================
-# MONTHLY SUMMARIES ENDPOINTS (SCOPED TO USER)
-# ==========================================
-
 @app.get(
     "/api/monthly-summaries",
     response_model=List[schemas.MonthlySummaryResponse],
     tags=["Monthly Summaries"],
 )
-def list_monthly_summaries(
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Retrieve all monthly expense summaries for the current user."""
-    summaries = crud.get_monthly_summaries(db, user_id=current_user.id)
+def list_monthly_summaries(db: Session = Depends(get_db)):
+    """Retrieve all monthly expense summaries."""
+    summaries = crud.get_monthly_summaries(db)
     result = []
     for s in summaries:
-        itemized_expenses = crud.get_expenses(db, user_id=current_user.id, month=s.month)
+        # compute itemized total for context
+        itemized_expenses = crud.get_expenses(db, month=s.month)
         itemized_total = round(sum(e.amount for e in itemized_expenses), 2)
         resp = schemas.MonthlySummaryResponse(
             id=s.id,
-            user_id=current_user.id,
             month=s.month,
             total_amount=round(s.total_amount, 2),
             note=s.note,
@@ -566,23 +433,18 @@ def list_monthly_summaries(
     response_model=schemas.MonthlySummaryResponse,
     tags=["Monthly Summaries"],
 )
-def get_monthly_summary(
-    month: str,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def get_monthly_summary(month: str, db: Session = Depends(get_db)):
     """Get the monthly summary for a specific month (YYYY-MM)."""
-    s = crud.get_monthly_summary_by_month(db, month, user_id=current_user.id)
+    s = crud.get_monthly_summary_by_month(db, month)
     if not s:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No monthly summary found for {month}",
         )
-    itemized_expenses = crud.get_expenses(db, user_id=current_user.id, month=s.month)
+    itemized_expenses = crud.get_expenses(db, month=s.month)
     itemized_total = round(sum(e.amount for e in itemized_expenses), 2)
     return schemas.MonthlySummaryResponse(
         id=s.id,
-        user_id=current_user.id,
         month=s.month,
         total_amount=round(s.total_amount, 2),
         note=s.note,
@@ -601,16 +463,18 @@ def get_monthly_summary(
 )
 def set_monthly_summary(
     summary_data: schemas.MonthlySummaryCreate,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Create or update a monthly summary for the authenticated user."""
-    s = crud.upsert_monthly_summary(db, summary_data, user_id=current_user.id)
-    itemized_expenses = crud.get_expenses(db, user_id=current_user.id, month=s.month)
+    """
+    Create or update a monthly summary.
+    Treats this amount as the official overall total for the month, preventing double-counting
+    while preserving all existing individual expense records.
+    """
+    s = crud.upsert_monthly_summary(db, summary_data)
+    itemized_expenses = crud.get_expenses(db, month=s.month)
     itemized_total = round(sum(e.amount for e in itemized_expenses), 2)
     return schemas.MonthlySummaryResponse(
         id=s.id,
-        user_id=current_user.id,
         month=s.month,
         total_amount=round(s.total_amount, 2),
         note=s.note,
@@ -626,13 +490,9 @@ def set_monthly_summary(
     status_code=status.HTTP_200_OK,
     tags=["Monthly Summaries"],
 )
-def remove_monthly_summary(
-    month: str,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Delete a monthly summary for the authenticated user."""
-    deleted = crud.delete_monthly_summary(db, month, user_id=current_user.id)
+def remove_monthly_summary(month: str, db: Session = Depends(get_db)):
+    """Delete a monthly summary, reverting the month's total to its itemized expense sum."""
+    deleted = crud.delete_monthly_summary(db, month)
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -642,7 +502,7 @@ def remove_monthly_summary(
 
 
 # ==========================================
-# BUDGETS ENDPOINTS (SCOPED TO USER)
+# STAGE 2: BUDGETS ENDPOINTS
 # ==========================================
 
 @app.get(
@@ -652,15 +512,14 @@ def remove_monthly_summary(
 )
 def list_budgets(
     month: Optional[str] = Query(None, description="Optional YYYY-MM to filter"),
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """List budgets and spending progress for current user."""
+    """List budgets and their spending progress."""
     if month and month.lower() != "all":
-        b = crud.get_budget_by_month(db, month, user_id=current_user.id)
-        return [crud.build_budget_response(db, b, user_id=current_user.id)] if b else []
-    budgets = crud.get_budgets(db, user_id=current_user.id)
-    return [crud.build_budget_response(db, b, user_id=current_user.id) for b in budgets]
+        b = crud.get_budget_by_month(db, month)
+        return [crud.build_budget_response(db, b)] if b else []
+    budgets = crud.get_budgets(db)
+    return [crud.build_budget_response(db, b) for b in budgets]
 
 
 @app.get(
@@ -668,16 +527,12 @@ def list_budgets(
     response_model=schemas.BudgetResponse,
     tags=["Budgets"],
 )
-def get_budget_for_month(
-    month: str,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Get budget for a specific month for current user."""
-    b = crud.get_budget_by_month(db, month, user_id=current_user.id)
+def get_budget_for_month(month: str, db: Session = Depends(get_db)):
+    """Get budget and spending calculation for a specific month."""
+    b = crud.get_budget_by_month(db, month)
     if not b:
         raise HTTPException(status_code=404, detail=f"No budget found for month {month}")
-    return crud.build_budget_response(db, b, user_id=current_user.id)
+    return crud.build_budget_response(db, b)
 
 
 @app.post(
@@ -688,32 +543,27 @@ def get_budget_for_month(
 )
 def set_budget(
     budget_data: schemas.BudgetCreate,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Create or update a monthly budget for current user."""
-    b = crud.upsert_budget(db, budget_data, user_id=current_user.id)
-    return crud.build_budget_response(db, b, user_id=current_user.id)
+    """Create or update a monthly budget with overall and category limits."""
+    b = crud.upsert_budget(db, budget_data)
+    return crud.build_budget_response(db, b)
 
 
 @app.delete(
     "/api/budgets/{month}",
     tags=["Budgets"],
 )
-def delete_budget(
-    month: str,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Delete a budget for a given month for current user."""
-    deleted = crud.delete_budget(db, month, user_id=current_user.id)
+def delete_budget(month: str, db: Session = Depends(get_db)):
+    """Delete a budget for a given month."""
+    deleted = crud.delete_budget(db, month)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"No budget found for {month}")
     return {"message": f"Budget for {month} deleted successfully", "month": month}
 
 
 # ==========================================
-# INCOME ENDPOINTS (SCOPED TO USER)
+# STAGE 2: INCOME ENDPOINTS
 # ==========================================
 
 @app.get(
@@ -726,17 +576,11 @@ def list_incomes(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Retrieve recorded income entries for current user."""
+    """Retrieve recorded income entries."""
     return crud.get_incomes(
-        db,
-        user_id=current_user.id,
-        month=month,
-        start_date=start_date,
-        end_date=end_date,
-        source=source,
+        db, month=month, start_date=start_date, end_date=end_date, source=source
     )
 
 
@@ -746,13 +590,9 @@ def list_incomes(
     status_code=status.HTTP_201_CREATED,
     tags=["Income"],
 )
-def add_income(
-    income_in: schemas.IncomeCreate,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Record a new income entry for current user."""
-    return crud.create_income(db, income_in, user_id=current_user.id)
+def add_income(income_in: schemas.IncomeCreate, db: Session = Depends(get_db)):
+    """Record a new income entry."""
+    return crud.create_income(db, income_in)
 
 
 @app.put(
@@ -763,11 +603,10 @@ def add_income(
 def modify_income(
     income_id: int,
     income_in: schemas.IncomeUpdate,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Update an existing income record owned by current user."""
-    updated = crud.update_income(db, income_id, income_in, user_id=current_user.id)
+    """Update an existing income record."""
+    updated = crud.update_income(db, income_id, income_in)
     if not updated:
         raise HTTPException(status_code=404, detail="Income record not found")
     return updated
@@ -777,13 +616,9 @@ def modify_income(
     "/api/incomes/{income_id}",
     tags=["Income"],
 )
-def remove_income(
-    income_id: int,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Delete an income entry owned by current user."""
-    deleted = crud.delete_income(db, income_id, user_id=current_user.id)
+def remove_income(income_id: int, db: Session = Depends(get_db)):
+    """Delete an income entry."""
+    deleted = crud.delete_income(db, income_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Income record not found")
     return {"message": "Income deleted successfully", "id": income_id}
@@ -798,21 +633,16 @@ def get_cash_flow(
     month: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Compute cash flow summary for current user."""
+    """Compute cash flow: Total Income, Total Expenses, Net Savings, and Savings Rate."""
     return crud.get_cash_flow_summary(
-        db,
-        user_id=current_user.id,
-        month=month,
-        start_date=start_date,
-        end_date=end_date,
+        db, month=month, start_date=start_date, end_date=end_date
     )
 
 
 # ==========================================
-# RECURRING EXPENSES ENDPOINTS (SCOPED TO USER)
+# STAGE 2: RECURRING EXPENSES ENDPOINTS
 # ==========================================
 
 @app.get(
@@ -822,10 +652,10 @@ def get_cash_flow(
 )
 def list_recurring_expenses(
     status_filter: Optional[str] = Query(None, alias="status"),
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    return crud.get_recurring_expenses(db, user_id=current_user.id, status=status_filter)
+    """List recurring subscriptions, rent, and utility commitments."""
+    return crud.get_recurring_expenses(db, status=status_filter)
 
 
 @app.post(
@@ -836,10 +666,10 @@ def list_recurring_expenses(
 )
 def add_recurring_expense(
     rec_in: schemas.RecurringExpenseCreate,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    return crud.create_recurring_expense(db, rec_in, user_id=current_user.id)
+    """Create a new recurring expense schedule."""
+    return crud.create_recurring_expense(db, rec_in)
 
 
 @app.put(
@@ -850,10 +680,10 @@ def add_recurring_expense(
 def modify_recurring_expense(
     recurring_id: int,
     rec_in: schemas.RecurringExpenseUpdate,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    updated = crud.update_recurring_expense(db, recurring_id, rec_in, user_id=current_user.id)
+    """Update a recurring expense schedule."""
+    updated = crud.update_recurring_expense(db, recurring_id, rec_in)
     if not updated:
         raise HTTPException(status_code=404, detail="Recurring expense not found")
     return updated
@@ -863,12 +693,9 @@ def modify_recurring_expense(
     "/api/recurring-expenses/{recurring_id}",
     tags=["Recurring Expenses"],
 )
-def remove_recurring_expense(
-    recurring_id: int,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    deleted = crud.delete_recurring_expense(db, recurring_id, user_id=current_user.id)
+def remove_recurring_expense(recurring_id: int, db: Session = Depends(get_db)):
+    """Delete a recurring expense schedule."""
+    deleted = crud.delete_recurring_expense(db, recurring_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Recurring expense not found")
     return {"message": "Recurring expense deleted successfully", "id": recurring_id}
@@ -882,17 +709,15 @@ def remove_recurring_expense(
 def toggle_recurring_expense_status(
     recurring_id: int,
     new_status: str = Query(..., description="active, paused, or stopped"),
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """Change recurring expense status (e.g. pause or stop)."""
     if new_status not in schemas.RECURRING_STATUSES:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid status. Must be one of: {', '.join(schemas.RECURRING_STATUSES)}",
         )
-    updated = crud.toggle_recurring_status(
-        db, recurring_id, new_status, user_id=current_user.id
-    )
+    updated = crud.toggle_recurring_status(db, recurring_id, new_status)
     if not updated:
         raise HTTPException(status_code=404, detail="Recurring expense not found")
     return updated
@@ -902,14 +727,12 @@ def toggle_recurring_expense_status(
     "/api/recurring-expenses/{recurring_id}/record-due",
     tags=["Recurring Expenses"],
 )
-def record_due_recurring_expense(
-    recurring_id: int,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    expense, recurring = crud.record_due_expense(
-        db, recurring_id, user_id=current_user.id
-    )
+def record_due_recurring_expense(recurring_id: int, db: Session = Depends(get_db)):
+    """
+    1-click action to record a due recurring expense into the Expense table
+    and advance the next_due_date automatically.
+    """
+    expense, recurring = crud.record_due_expense(db, recurring_id)
     if not expense:
         raise HTTPException(status_code=404, detail="Recurring expense not found")
     return {
@@ -920,7 +743,7 @@ def record_due_recurring_expense(
 
 
 # ==========================================
-# SAVINGS GOALS ENDPOINTS (SCOPED TO USER)
+# STAGE 2: SAVINGS GOALS ENDPOINTS
 # ==========================================
 
 @app.get(
@@ -930,10 +753,10 @@ def record_due_recurring_expense(
 )
 def list_savings_goals(
     status_filter: Optional[str] = Query(None, alias="status"),
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    goals = crud.get_savings_goals(db, user_id=current_user.id, status=status_filter)
+    """List savings goals with progress percentages and remaining targets."""
+    goals = crud.get_savings_goals(db, status=status_filter)
     return [crud.build_savings_goal_response(g) for g in goals]
 
 
@@ -945,10 +768,10 @@ def list_savings_goals(
 )
 def add_savings_goal(
     goal_in: schemas.SavingsGoalCreate,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    goal = crud.create_savings_goal(db, goal_in, user_id=current_user.id)
+    """Create a new savings goal target."""
+    goal = crud.create_savings_goal(db, goal_in)
     return crud.build_savings_goal_response(goal)
 
 
@@ -960,10 +783,10 @@ def add_savings_goal(
 def modify_savings_goal(
     goal_id: int,
     goal_in: schemas.SavingsGoalUpdate,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    goal = crud.update_savings_goal(db, goal_id, goal_in, user_id=current_user.id)
+    """Update a savings goal."""
+    goal = crud.update_savings_goal(db, goal_id, goal_in)
     if not goal:
         raise HTTPException(status_code=404, detail="Savings goal not found")
     return crud.build_savings_goal_response(goal)
@@ -973,12 +796,9 @@ def modify_savings_goal(
     "/api/savings-goals/{goal_id}",
     tags=["Savings Goals"],
 )
-def remove_savings_goal(
-    goal_id: int,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    deleted = crud.delete_savings_goal(db, goal_id, user_id=current_user.id)
+def remove_savings_goal(goal_id: int, db: Session = Depends(get_db)):
+    """Delete a savings goal."""
+    deleted = crud.delete_savings_goal(db, goal_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Savings goal not found")
     return {"message": "Savings goal deleted successfully", "id": goal_id}
@@ -992,12 +812,11 @@ def remove_savings_goal(
 def add_contribution(
     goal_id: int,
     contrib: schemas.GoalContributionRequest,
-    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    goal = crud.contribute_to_goal(
-        db, goal_id, contrib.amount, user_id=current_user.id
-    )
+    """Add a contribution in INR to a savings target."""
+    goal = crud.contribute_to_goal(db, goal_id, contrib.amount)
     if not goal:
         raise HTTPException(status_code=404, detail="Savings goal not found")
     return crud.build_savings_goal_response(goal)
+
